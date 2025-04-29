@@ -1,4 +1,5 @@
-from flask import Flask, render_template_string, request, redirect, url_for, session, flash
+
+from flask import Flask, render_template_string, request, redirect, url_for, session, flash, send_file
 import os
 import json
 import base64
@@ -7,72 +8,22 @@ import string
 from hashlib import sha256
 from datetime import datetime, timedelta
 from cryptography.fernet import Fernet
+from io import BytesIO
 
-# --- CONFIGURATION ---
 app = Flask(__name__)
 app.secret_key = os.urandom(24)
 
-MASTER_PASSWORD_HASH = None  # Set during first run
+USER_DATA_FILE = "users.json"
 DATA_FILE = "passwords.enc"
 
-# --- HTML Templates ---
-login_template = """
-<!doctype html>
-<title>Login</title>
-<h2>Login</h2>
-<form method="post">
-    Master Password: <input type="password" name="password">
-    <input type="submit" value="Login">
-</form>
-"""
-
-home_template = """
-<!doctype html>
-<title>Password Manager</title>
-<h2>Welcome to Password Manager</h2>
-<a href="{{ url_for('logout') }}">Logout</a>
-<hr>
-<h3>Generate New Password</h3>
-<form method="post" action="/add">
-    Service Title: <input name="title"><br>
-    Username: <input name="username"><br>
-    Password: <input name="password" id="password-field"><br>
-    <button type="button" onclick="generatePassword()">Generate Password</button>
-    <button type="submit">Save</button>
-</form>
-<script>
-function generatePassword() {
-    fetch("/generate-password").then(res => res.text()).then(pw => {
-        document.getElementById("password-field").value = pw;
-    });
-}
-</script>
-<hr>
-<h3>Search Saved Passwords</h3>
-<form method="get" action="/search">
-    Title: <input name="query">
-    <button type="submit">Search</button>
-</form>
-{% if entries %}
-    <h4>Results:</h4>
-    {% for entry in entries %}
-        <p><b>{{ entry['title'] }}</b><br>Username: {{ entry['username'] }}<br>Password: {{ entry['password'] }}<br><i>{{ entry['created'] }}</i>
-        {% if entry['expired'] %}<br><span style='color:red;'>Password expired! Update soon!</span>{% endif %}</p><hr>
-    {% endfor %}
-{% endif %}
-"""
-
-# --- Utilities ---
 def generate_key(password):
     return base64.urlsafe_b64encode(sha256(password.encode()).digest())
 
 def encrypt_data(data, password):
-    f = Fernet(generate_key(password))
-    return f.encrypt(json.dumps(data).encode())
+    return Fernet(generate_key(password)).encrypt(json.dumps(data).encode())
 
 def decrypt_data(token, password):
-    f = Fernet(generate_key(password))
-    return json.loads(f.decrypt(token).decode())
+    return json.loads(Fernet(generate_key(password)).decrypt(token).decode())
 
 def save_data(data, password):
     with open(DATA_FILE, "wb") as f:
@@ -85,94 +36,169 @@ def load_data(password):
         try:
             return decrypt_data(f.read(), password)
         except:
-            return None
+            return []
 
-def generate_strong_password(length=16):
-    all_chars = string.ascii_letters + string.digits + string.punctuation
+def generate_password(length=16):
+    chars = string.ascii_letters + string.digits + string.punctuation
     while True:
-        password = ''.join(random.choices(all_chars, k=length))
-        if any(c.islower() for c in password) and any(c.isupper() for c in password) and any(c.isdigit() for c in password) and any(c in string.punctuation for c in password):
-            return password
+        pwd = ''.join(random.choices(chars, k=length))
+        if all(any(c in group for c in pwd) for group in [string.ascii_lowercase, string.ascii_uppercase, string.digits, string.punctuation]):
+            return pwd
 
-# --- Routes ---
+def check_strength(pwd):
+    score = sum([
+        any(c.islower() for c in pwd),
+        any(c.isupper() for c in pwd),
+        any(c.isdigit() for c in pwd),
+        any(c in string.punctuation for c in pwd)
+    ])
+    if len(pwd) >= 12 and score == 4:
+        return "Strong"
+    elif len(pwd) >= 8 and score >= 3:
+        return "Okay"
+    return "Weak"
+
+def load_users():
+    return json.load(open(USER_DATA_FILE)) if os.path.exists(USER_DATA_FILE) else {}
+
+def save_users(users):
+    with open(USER_DATA_FILE, "w") as f:
+        json.dump(users, f)
+
 @app.route('/', methods=['GET', 'POST'])
 def login():
-    global MASTER_PASSWORD_HASH
-    if MASTER_PASSWORD_HASH is None:
-        if os.path.exists("master.hash"):
-            with open("master.hash") as f:
-                MASTER_PASSWORD_HASH = f.read().strip()
-        else:
-            # First run setup
-            if request.method == 'POST':
-                pw = request.form['password']
-                MASTER_PASSWORD_HASH = sha256(pw.encode()).hexdigest()
-                with open("master.hash", "w") as f:
-                    f.write(MASTER_PASSWORD_HASH)
-                session['password'] = pw
-                return redirect(url_for('home'))
-            return render_template_string(login_template)
-
     if request.method == 'POST':
-        pw = request.form['password']
-        if sha256(pw.encode()).hexdigest() == MASTER_PASSWORD_HASH:
-            session['password'] = pw
+        users = load_users()
+        username = request.form['username']
+        password = request.form['password']
+        hashed_pw = sha256(password.encode()).hexdigest()
+        if username in users and users[username] == hashed_pw:
+            session['username'] = username
+            session['password'] = password
             return redirect(url_for('home'))
+        flash("Invalid login.")
+    return render_template_string(login_html)
+
+@app.route('/register', methods=['GET', 'POST'])
+def register():
+    if request.method == 'POST':
+        users = load_users()
+        username = request.form['username']
+        password = request.form['password']
+        if username in users:
+            flash("Username exists.")
         else:
-            flash("Wrong password")
-            return render_template_string(login_template)
-    return render_template_string(login_template)
+            users[username] = sha256(password.encode()).hexdigest()
+            save_users(users)
+            return redirect(url_for('login'))
+    return render_template_string(register_html)
 
-@app.route('/home')
+@app.route('/home', methods=['GET', 'POST'])
 def home():
-    if 'password' not in session:
+    if 'username' not in session:
         return redirect(url_for('login'))
-    return render_template_string(home_template)
 
-@app.route('/add', methods=['POST'])
-def add():
-    if 'password' not in session:
+    entries = load_data(session['password'])
+    if request.method == 'POST':
+        title = request.form['title']
+        uname = request.form['username']
+        pwd = request.form['password']
+        entries.append({
+            'title': title,
+            'username': uname,
+            'password': pwd,
+            'created': datetime.now().isoformat()
+        })
+        save_data(entries, session['password'])
+        return redirect(url_for('home'))
+
+    for entry in entries:
+        created = datetime.fromisoformat(entry['created'])
+        entry['expired'] = (datetime.now() - created) > timedelta(days=30)
+        entry['strength'] = check_strength(entry['password'])
+
+    return render_template_string(home_html, entries=entries)
+
+@app.route('/delete/<int:index>')
+def delete(index):
+    if 'username' not in session:
         return redirect(url_for('login'))
-    title = request.form['title']
-    username = request.form['username']
-    password = request.form['password']
-
-    entries = load_data(session['password']) or []
-    entries.append({
-        "title": title,
-        "username": username,
-        "password": password,
-        "created": datetime.now().isoformat()
-    })
-    save_data(entries, session['password'])
+    data = load_data(session['password'])
+    if 0 <= index < len(data):
+        data.pop(index)
+        save_data(data, session['password'])
     return redirect(url_for('home'))
 
-@app.route('/search')
-def search():
-    if 'password' not in session:
+@app.route('/backup')
+def backup():
+    if 'username' not in session:
         return redirect(url_for('login'))
-    query = request.args.get('query', '').lower()
-    entries = load_data(session['password']) or []
-    results = []
-    for e in entries:
-        if query in e['title'].lower():
-            created = datetime.fromisoformat(e['created'])
-            expired = (datetime.now() - created) > timedelta(days=30)
-            e['expired'] = expired
-            results.append(e)
-    return render_template_string(home_template, entries=results)
-
-@app.route('/generate-password')
-def generate_password():
-    return generate_strong_password()
+    data = load_data(session['password'])
+    encrypted_json = encrypt_data(data, session['password'])
+    return send_file(BytesIO(encrypted_json), mimetype='application/octet-stream',
+                     as_attachment=True, download_name='passwords_backup.enc')
 
 @app.route('/logout')
 def logout():
     session.clear()
     return redirect(url_for('login'))
 
-# --- Start Server ---
+login_html = """<!doctype html><html><head><title>Login</title></head><body class="container">
+<h2>Login</h2>
+<form method="post">
+  Username: <input name="username"><br>
+  Password: <input type="password" name="password"><br>
+  <button type="submit">Login</button>
+</form>
+<p>Or <a href="/register">Register</a></p></body></html>"""
+
+register_html = """<!doctype html><html><head><title>Register</title></head><body class="container">
+<h2>Register</h2>
+<form method="post">
+  Username: <input name="username"><br>
+  Password: <input type="password" name="password"><br>
+  <button type="submit">Register</button>
+</form></body></html>"""
+
+home_html = """<!doctype html><html><head>
+<title>Dashboard</title>
+<link rel="stylesheet" href="/static/static.css">
+<script>
+function setTheme(bg, input) {
+  document.body.style.backgroundColor = bg;
+  document.querySelectorAll('input, textarea').forEach(el => el.style.backgroundColor = input);
+}
+</script>
+</head><body class="container">
+<h2>Welcome {{ session['username'] }} <small style="font-weight:normal;">(Phase 2)</small></h2>
+<a href="/logout">Logout</a>
+<a href="/backup" style="float:right;">Download Backup</a>
+<hr>
+<h3>Add New Login</h3>
+<form method="post">
+  Title: <input name="title"><br>
+  Username: <input name="username"><br>
+  Password: <input name="password" id="pwd"><br>
+  <button type="button" onclick="document.getElementById('pwd').value=Math.random().toString(36).slice(-12)">Generate</button>
+  <button type="submit">Save</button>
+</form>
+<hr>
+<h3>Stored Logins</h3>
+{% for e in entries %}
+<div class="card">
+  <strong>{{ e['title'] }}</strong><br>
+  Username: {{ e['username'] }}<br>
+  Password: {{ e['password'] }}<br>
+  Strength: <span class="{{ e['strength'].lower() }}">{{ e['strength'] }}</span>
+  {% if e['expired'] %}<br><span class="expired">Password expired!</span>{% endif %}<br>
+  <a href="/delete/{{ loop.index0 }}">Delete</a>
+</div>
+{% endfor %}
+<h3>Theme</h3>
+<button onclick="setTheme('#111', '#333')">Dark Mode</button>
+<button onclick="setTheme('#fff', '#f0f0f0')">Light Mode</button>
+</body></html>"""
+
 if __name__ == "__main__":
-    import os
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
