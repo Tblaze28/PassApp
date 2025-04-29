@@ -12,7 +12,6 @@ from cryptography.fernet import Fernet
 
 app = Flask(__name__)
 app.secret_key = os.urandom(24)
-
 DATABASE = "vaultyx.db"
 
 def get_db():
@@ -42,6 +41,8 @@ def init_db():
         username TEXT NOT NULL,
         password TEXT NOT NULL,
         created TEXT NOT NULL,
+        category TEXT DEFAULT '',
+        favorite INTEGER DEFAULT 0,
         FOREIGN KEY(user_id) REFERENCES users(id)
     );
     """)
@@ -119,13 +120,16 @@ def home():
         title = request.form["title"]
         username = encrypt_text(request.form["username"], uname, pw)
         password = encrypt_text(request.form["password"], uname, pw)
+        category = request.form.get("category", "")
+        favorite = 1 if request.form.get("favorite") else 0
         created = datetime.now().isoformat()
-        db.execute("INSERT INTO entries (user_id, title, username, password, created) VALUES (?, ?, ?, ?, ?)",
-                   (uid, title, username, password, created))
+        db.execute("INSERT INTO entries (user_id, title, username, password, created, category, favorite) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                   (uid, title, username, password, created, category, favorite))
         db.commit()
         return redirect(url_for("home"))
 
-    cur = db.execute("SELECT * FROM entries WHERE user_id = ?", (uid,))
+    cur = db.execute("SELECT * FROM entries WHERE user_id = ? ORDER BY favorite DESC, title ASC", (uid,))
+    seen_titles = set()
     entries = []
     for row in cur.fetchall():
         try:
@@ -134,10 +138,14 @@ def home():
                 "title": row["title"],
                 "username": decrypt_text(row["username"], uname, pw),
                 "password": decrypt_text(row["password"], uname, pw),
-                "created": row["created"]
+                "created": row["created"],
+                "category": row["category"],
+                "favorite": row["favorite"]
             }
             entry["expired"] = (datetime.now() - datetime.fromisoformat(entry["created"])) > timedelta(days=30)
             entry["strength"] = check_strength(entry["password"])
+            entry["reused"] = entry["title"] in seen_titles
+            seen_titles.add(entry["title"])
             entries.append(entry)
         except:
             continue
@@ -157,6 +165,14 @@ def delete(eid):
 def logout():
     session.clear()
     return redirect(url_for("login"))
+
+@app.route("/generate-password")
+def generate_password():
+    chars = string.ascii_letters + string.digits + string.punctuation
+    while True:
+        pwd = ''.join(random.choices(chars, k=16))
+        if check_strength(pwd) == "Strong":
+            return pwd
 
 login_html = """<!doctype html><html><head><title>Vaultyx Login</title></head><body style='background:#0A192F;color:white;padding:2rem;'>
 <h2>Login to Vaultyx</h2>
@@ -182,26 +198,24 @@ function setTheme(mode) {
   localStorage.setItem("theme", mode);
   document.body.className = mode;
 }
+function generatePassword() {
+  fetch("/generate-password").then(res => res.text()).then(pw => {
+    document.getElementById("password").value = pw;
+  });
+}
 window.onload = () => {
   let theme = localStorage.getItem("theme") || "dark";
   document.body.className = theme;
 }
 </script>
 <style>
-body.dark {
-  background: #0A192F;
-  color: white;
-}
-body.light {
-  background: white;
-  color: black;
-}
-input, button {
-  padding: 0.5rem; margin-top: 0.5rem;
-}
+body.dark { background: #0A192F; color: white; }
+body.light { background: white; color: black; }
+input, button { padding: 0.5rem; margin-top: 0.5rem; }
 .strong { color: limegreen; }
 .okay { color: orange; }
 .weak { color: red; }
+.reused { background-color: rgba(255, 165, 0, 0.2); }
 </style>
 </head><body>
 <h2>Vaultyx – Secure your digital world</h2>
@@ -215,18 +229,23 @@ input, button {
 <form method="post">
   Title: <input name="title"><br>
   Username: <input name="username"><br>
-  Password: <input name="password"><br>
+  Password: <input name="password" id="password"><br>
+  <button type="button" onclick="generatePassword()">Generate</button><br>
+  Folder: <input name="category"><br>
+  Favorite: <input type="checkbox" name="favorite"><br>
   <button type="submit">Save</button>
 </form>
 <hr>
 <h3>Saved Logins</h3>
 {% for e in entries %}
-<div style="margin-bottom:1rem;">
-  <strong>{{ e.title }}</strong><br>
+<div style="margin-bottom:1rem;" class="{{ 'reused' if e.reused else '' }}">
+  <strong>{{ e.title }}</strong> {% if e.favorite %}⭐{% endif %}<br>
+  Category: {{ e.category }}<br>
   Username: {{ e.username }}<br>
   Password: {{ e.password }}<br>
   Strength: <span class="{{ e.strength.lower() }}">{{ e.strength }}</span>
   {% if e.expired %}<br><span style="color:red;">Expired!</span>{% endif %}<br>
+  {% if e.reused %}<span style="color:orange;">⚠ Reused Title</span><br>{% endif %}
   <a href="/delete/{{ e.id }}">Delete</a>
 </div>
 {% endfor %}
