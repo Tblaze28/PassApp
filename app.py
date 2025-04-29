@@ -1,5 +1,8 @@
 
-from flask import Flask, render_template_string, request, redirect, url_for, session, flash, g
+from flask import Flask
+# --- QR Login Memory (simple store for tokens) ---
+qr_tokens = {}
+, render_template_string, request, redirect, url_for, session, flash, g
 import os
 import sqlite3
 import base64
@@ -203,6 +206,22 @@ function generatePassword() {
     document.getElementById("password").value = pw;
   });
 }
+<script>
+let logoutTimer;
+function resetTimer() {
+    clearTimeout(logoutTimer);
+    logoutTimer = setTimeout(() => {
+        window.location.href = '/logout';
+    }, 300000); // 5 minutes
+}
+window.onload = () => {
+    let theme = localStorage.getItem("theme") || "dark";
+    document.body.className = theme;
+    resetTimer();
+    document.addEventListener('mousemove', resetTimer);
+    document.addEventListener('keydown', resetTimer);
+}
+</script>
 window.onload = () => {
   let theme = localStorage.getItem("theme") || "dark";
   document.body.className = theme;
@@ -254,3 +273,79 @@ input, button { padding: 0.5rem; margin-top: 0.5rem; }
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
+@app.route("/qr-login", methods=["GET"])
+def qr_login():
+    if "user_id" not in session:
+        return redirect(url_for("login"))
+
+    token = secrets.token_urlsafe(16)
+    qr_tokens[token] = session["username"]
+    return render_template_string("""
+    <!doctype html><html><head><title>QR Code Login</title></head><body style="background:#0A192F;color:white;">
+    <h2>Scan this QR Code with your phone</h2>
+    <img src="https://api.qrserver.com/v1/create-qr-code/?size=200x200&data={{ url }}">
+    <p>QR Token: {{ token }}</p>
+    </body></html>
+    """, url=request.host_url + "confirm-qr-login?token=" + token, token=token)
+
+@app.route("/confirm-qr-login", methods=["GET"])
+def confirm_qr_login():
+    token = request.args.get("token")
+    if token in qr_tokens:
+        username = qr_tokens[token]
+        del qr_tokens[token]
+
+        db = get_db()
+        cur = db.execute("SELECT * FROM users WHERE username = ?", (username,))
+        user = cur.fetchone()
+        if user:
+            session["user_id"] = user["id"]
+            session["username"] = user["username"]
+            session["password"] = ""  # Optional: require re-auth for encryption
+            return redirect(url_for("home"))
+    return "Invalid or expired QR token", 403
+
+import secrets
+
+# Token store for extension sessions (simple in-memory)
+extension_tokens = {}
+
+@app.route("/api/request-token")
+def request_token():
+    if "user_id" not in session:
+        return {"error": "Unauthorized"}, 401
+    token = secrets.token_urlsafe(16)
+    extension_tokens[token] = session["user_id"]
+    return {"token": token}
+
+@app.route("/api/passwords")
+def api_passwords():
+    token = request.args.get("token")
+    if token not in extension_tokens:
+        return {"error": "Invalid or expired token"}, 403
+
+    uid = extension_tokens[token]
+    db = get_db()
+    cur = db.execute("SELECT * FROM entries WHERE user_id = ?", (uid,))
+    uname = None
+    pw = None
+    if 'username' in session and 'password' in session:
+        uname = session["username"]
+        pw = session["password"]
+
+    entries = []
+    for row in cur.fetchall():
+        try:
+            entry = {
+                "title": row["title"],
+                "username": decrypt_text(row["username"], uname, pw) if uname and pw else "****",
+                "password": decrypt_text(row["password"], uname, pw) if uname and pw else "****",
+                "category": row["category"],
+                "favorite": bool(row["favorite"])
+            }
+            entries.append(entry)
+        except:
+            continue
+
+    return {"entries": entries}
