@@ -16,25 +16,25 @@ app.secret_key = os.urandom(24)
 USER_DATA_FILE = "users.json"
 DATA_FILE = "passwords.enc"
 
-def generate_key(password):
-    return base64.urlsafe_b64encode(sha256(password.encode()).digest())
+def generate_key(username, password):
+    return base64.urlsafe_b64encode(sha256((username + password).encode()).digest())
 
-def encrypt_data(data, password):
-    return Fernet(generate_key(password)).encrypt(json.dumps(data).encode())
+def encrypt_data(data, username, password):
+    return Fernet(generate_key(username, password)).encrypt(json.dumps(data).encode())
 
-def decrypt_data(token, password):
-    return json.loads(Fernet(generate_key(password)).decrypt(token).decode())
+def decrypt_data(token, username, password):
+    return json.loads(Fernet(generate_key(username, password)).decrypt(token).decode())
 
-def save_data(data, password):
+def save_data(data, username, password):
     with open(DATA_FILE, "wb") as f:
-        f.write(encrypt_data(data, password))
+        f.write(encrypt_data(data, username, password))
 
-def load_data(password):
+def load_data(username, password):
     if not os.path.exists(DATA_FILE):
         return []
     with open(DATA_FILE, "rb") as f:
         try:
-            return decrypt_data(f.read(), password)
+            return decrypt_data(f.read(), username, password)
         except:
             return []
 
@@ -98,7 +98,7 @@ def home():
     if 'username' not in session:
         return redirect(url_for('login'))
 
-    entries = load_data(session['password'])
+    entries = load_data(session['username'], session['password'])
     if request.method == 'POST':
         title = request.form['title']
         uname = request.form['username']
@@ -109,7 +109,7 @@ def home():
             'password': pwd,
             'created': datetime.now().isoformat()
         })
-        save_data(entries, session['password'])
+        save_data(entries, session['username'], session['password'])
         return redirect(url_for('home'))
 
     for entry in entries:
@@ -123,18 +123,18 @@ def home():
 def delete(index):
     if 'username' not in session:
         return redirect(url_for('login'))
-    data = load_data(session['password'])
+    data = load_data(session['username'], session['password'])
     if 0 <= index < len(data):
         data.pop(index)
-        save_data(data, session['password'])
+        save_data(data, session['username'], session['password'])
     return redirect(url_for('home'))
 
 @app.route('/backup')
 def backup():
     if 'username' not in session:
         return redirect(url_for('login'))
-    data = load_data(session['password'])
-    encrypted_json = encrypt_data(data, session['password'])
+    data = load_data(session['username'], session['password'])
+    encrypted_json = encrypt_data(data, session['username'], session['password'])
     return send_file(BytesIO(encrypted_json), mimetype='application/octet-stream',
                      as_attachment=True, download_name='passwords_backup.enc')
 
@@ -170,7 +170,7 @@ function setTheme(bg, input) {
 }
 </script>
 </head><body class="container">
-<h2>Welcome {{ session['username'] }} <small style="font-weight:normal;">(Phase 2)</small></h2>
+<h2>Welcome {{ session['username'] }} <small style="font-weight:normal;">(Phase 2 - Fixed Key)</small></h2>
 <a href="/logout">Logout</a>
 <a href="/backup" style="float:right;">Download Backup</a>
 <hr>
