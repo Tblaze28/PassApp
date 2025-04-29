@@ -15,7 +15,6 @@ app.secret_key = os.urandom(24)
 
 DATABASE = "vaultyx.db"
 
-# -- DATABASE CONNECTION --
 def get_db():
     if "db" not in g:
         g.db = sqlite3.connect(DATABASE)
@@ -36,7 +35,6 @@ def init_db():
         username TEXT UNIQUE NOT NULL,
         password_hash TEXT NOT NULL
     );
-
     CREATE TABLE IF NOT EXISTS entries (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         user_id INTEGER NOT NULL,
@@ -53,7 +51,6 @@ def init_db():
 def before_request():
     init_db()
 
-# -- ENCRYPTION UTILITY --
 def generate_key(username, password):
     return base64.urlsafe_b64encode(sha256((username + password).encode()).digest())
 
@@ -76,8 +73,6 @@ def check_strength(pwd):
         return "Okay"
     return "Weak"
 
-# -- ROUTES --
-
 @app.route("/", methods=["GET", "POST"])
 def login():
     if request.method == "POST":
@@ -92,7 +87,7 @@ def login():
             session["username"] = username
             session["password"] = password
             return redirect(url_for("home"))
-        flash("Invalid credentials.")
+        flash("Invalid login.")
     return render_template_string(login_html)
 
 @app.route("/register", methods=["GET", "POST"])
@@ -135,6 +130,7 @@ def home():
     for row in cur.fetchall():
         try:
             entry = {
+                "id": row["id"],
                 "title": row["title"],
                 "username": decrypt_text(row["username"], uname, pw),
                 "password": decrypt_text(row["password"], uname, pw),
@@ -162,44 +158,77 @@ def logout():
     session.clear()
     return redirect(url_for("login"))
 
-# HTML templates
-login_html = """<!doctype html><html><head><title>Login</title></head><body>
-<h2>Login</h2>
+login_html = """<!doctype html><html><head><title>Vaultyx Login</title></head><body style='background:#0A192F;color:white;padding:2rem;'>
+<h2>Login to Vaultyx</h2>
 <form method="post">
-  Username: <input name="username"><br>
-  Password: <input type="password" name="password"><br>
+  Username: <input name="username"><br><br>
+  Password: <input type="password" name="password"><br><br>
   <button type="submit">Login</button>
 </form>
-<p><a href="/register">Register</a></p></body></html>"""
+<p><a href="/register" style="color:#03A9F4;">Register</a></p></body></html>"""
 
-register_html = """<!doctype html><html><head><title>Register</title></head><body>
-<h2>Register</h2>
+register_html = """<!doctype html><html><head><title>Register Vaultyx</title></head><body style='background:#0A192F;color:white;padding:2rem;'>
+<h2>Register for Vaultyx</h2>
 <form method="post">
-  Username: <input name="username"><br>
-  Password: <input type="password" name="password"><br>
+  Username: <input name="username"><br><br>
+  Password: <input type="password" name="password"><br><br>
   <button type="submit">Register</button>
 </form></body></html>"""
 
-home_html = """<!doctype html><html><head><title>Vaultyx</title></head><body>
-<h2>Welcome {{ session['username'] }}</h2>
-<a href="/logout">Logout</a><hr>
+home_html = """<!doctype html><html><head>
+<title>Vaultyx Dashboard</title>
+<script>
+function setTheme(mode) {
+  localStorage.setItem("theme", mode);
+  document.body.className = mode;
+}
+window.onload = () => {
+  let theme = localStorage.getItem("theme") || "dark";
+  document.body.className = theme;
+}
+</script>
+<style>
+body.dark {
+  background: #0A192F;
+  color: white;
+}
+body.light {
+  background: white;
+  color: black;
+}
+input, button {
+  padding: 0.5rem; margin-top: 0.5rem;
+}
+.strong { color: limegreen; }
+.okay { color: orange; }
+.weak { color: red; }
+</style>
+</head><body>
+<h2>Vaultyx – Secure your digital world</h2>
+<a href="/logout">Logout</a>
+<div style="float:right;">
+  <button onclick="setTheme('dark')">Dark</button>
+  <button onclick="setTheme('light')">Light</button>
+</div>
+<hr>
 <h3>Add Login</h3>
 <form method="post">
   Title: <input name="title"><br>
   Username: <input name="username"><br>
   Password: <input name="password"><br>
   <button type="submit">Save</button>
-</form><hr>
-<h3>Saved Entries</h3>
+</form>
+<hr>
+<h3>Saved Logins</h3>
 {% for e in entries %}
-<div>
-  <b>{{ e.title }}</b><br>
+<div style="margin-bottom:1rem;">
+  <strong>{{ e.title }}</strong><br>
   Username: {{ e.username }}<br>
   Password: {{ e.password }}<br>
-  Strength: <span style="color: {% if e.strength == 'Strong' %}green{% elif e.strength == 'Okay' %}orange{% else %}red{% endif %};">{{ e.strength }}</span>
-  {% if e.expired %}<br><span style="color:red;">Expired</span>{% endif %}<br>
-  <a href="/delete/{{ loop.index0 }}">Delete</a>
-</div><hr>
+  Strength: <span class="{{ e.strength.lower() }}">{{ e.strength }}</span>
+  {% if e.expired %}<br><span style="color:red;">Expired!</span>{% endif %}<br>
+  <a href="/delete/{{ e.id }}">Delete</a>
+</div>
 {% endfor %}
 </body></html>"""
 
