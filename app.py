@@ -1,49 +1,67 @@
 
-from flask import Flask, render_template_string, request, redirect, url_for, session, flash, send_file
+from flask import Flask, render_template_string, request, redirect, url_for, session, flash, g
 import os
-import json
+import sqlite3
 import base64
+import json
 import random
 import string
 from hashlib import sha256
 from datetime import datetime, timedelta
 from cryptography.fernet import Fernet
-from io import BytesIO
 
 app = Flask(__name__)
 app.secret_key = os.urandom(24)
 
-USER_DATA_FILE = "users.json"
-DATA_FILE = "passwords.enc"
+DATABASE = "vaultyx.db"
 
+# -- DATABASE CONNECTION --
+def get_db():
+    if "db" not in g:
+        g.db = sqlite3.connect(DATABASE)
+        g.db.row_factory = sqlite3.Row
+    return g.db
+
+@app.teardown_appcontext
+def close_connection(exception):
+    db = g.pop("db", None)
+    if db is not None:
+        db.close()
+
+def init_db():
+    db = get_db()
+    db.executescript("""
+    CREATE TABLE IF NOT EXISTS users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username TEXT UNIQUE NOT NULL,
+        password_hash TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS entries (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        title TEXT NOT NULL,
+        username TEXT NOT NULL,
+        password TEXT NOT NULL,
+        created TEXT NOT NULL,
+        FOREIGN KEY(user_id) REFERENCES users(id)
+    );
+    """)
+    db.commit()
+
+@app.before_request
+def before_request():
+    init_db()
+
+# -- ENCRYPTION UTILITY --
 def generate_key(username, password):
     return base64.urlsafe_b64encode(sha256((username + password).encode()).digest())
 
-def encrypt_data(data, username, password):
-    return Fernet(generate_key(username, password)).encrypt(json.dumps(data).encode())
+def encrypt_text(text, username, password):
+    return Fernet(generate_key(username, password)).encrypt(text.encode()).decode()
 
-def decrypt_data(token, username, password):
-    return json.loads(Fernet(generate_key(username, password)).decrypt(token).decode())
-
-def save_data(data, username, password):
-    with open(DATA_FILE, "wb") as f:
-        f.write(encrypt_data(data, username, password))
-
-def load_data(username, password):
-    if not os.path.exists(DATA_FILE):
-        return []
-    with open(DATA_FILE, "rb") as f:
-        try:
-            return decrypt_data(f.read(), username, password)
-        except:
-            return []
-
-def generate_password(length=16):
-    chars = string.ascii_letters + string.digits + string.punctuation
-    while True:
-        pwd = ''.join(random.choices(chars, k=length))
-        if all(any(c in group for c in pwd) for group in [string.ascii_lowercase, string.ascii_uppercase, string.digits, string.punctuation]):
-            return pwd
+def decrypt_text(token, username, password):
+    return Fernet(generate_key(username, password)).decrypt(token.encode()).decode()
 
 def check_strength(pwd):
     score = sum([
@@ -58,101 +76,103 @@ def check_strength(pwd):
         return "Okay"
     return "Weak"
 
-def load_users():
-    return json.load(open(USER_DATA_FILE)) if os.path.exists(USER_DATA_FILE) else {}
+# -- ROUTES --
 
-def save_users(users):
-    with open(USER_DATA_FILE, "w") as f:
-        json.dump(users, f)
-
-@app.route('/', methods=['GET', 'POST'])
+@app.route("/", methods=["GET", "POST"])
 def login():
-    if request.method == 'POST':
-        users = load_users()
-        username = request.form['username']
-        password = request.form['password']
-        hashed_pw = sha256(password.encode()).hexdigest()
-        if username in users and users[username] == hashed_pw:
-            session['username'] = username
-            session['password'] = password
-            return redirect(url_for('home'))
-        flash("Invalid login.")
+    if request.method == "POST":
+        db = get_db()
+        username = request.form["username"]
+        password = request.form["password"]
+        hashed = sha256(password.encode()).hexdigest()
+        cur = db.execute("SELECT * FROM users WHERE username = ? AND password_hash = ?", (username, hashed))
+        user = cur.fetchone()
+        if user:
+            session["user_id"] = user["id"]
+            session["username"] = username
+            session["password"] = password
+            return redirect(url_for("home"))
+        flash("Invalid credentials.")
     return render_template_string(login_html)
 
-@app.route('/register', methods=['GET', 'POST'])
+@app.route("/register", methods=["GET", "POST"])
 def register():
-    if request.method == 'POST':
-        users = load_users()
-        username = request.form['username']
-        password = request.form['password']
-        if username in users:
-            flash("Username exists.")
-        else:
-            users[username] = sha256(password.encode()).hexdigest()
-            save_users(users)
-            return redirect(url_for('login'))
+    if request.method == "POST":
+        db = get_db()
+        username = request.form["username"]
+        password = request.form["password"]
+        hashed = sha256(password.encode()).hexdigest()
+        try:
+            db.execute("INSERT INTO users (username, password_hash) VALUES (?, ?)", (username, hashed))
+            db.commit()
+            return redirect(url_for("login"))
+        except sqlite3.IntegrityError:
+            flash("Username already exists.")
     return render_template_string(register_html)
 
-@app.route('/home', methods=['GET', 'POST'])
+@app.route("/home", methods=["GET", "POST"])
 def home():
-    if 'username' not in session:
-        return redirect(url_for('login'))
+    if "user_id" not in session:
+        return redirect(url_for("login"))
 
-    entries = load_data(session['username'], session['password'])
-    if request.method == 'POST':
-        title = request.form['title']
-        uname = request.form['username']
-        pwd = request.form['password']
-        entries.append({
-            'title': title,
-            'username': uname,
-            'password': pwd,
-            'created': datetime.now().isoformat()
-        })
-        save_data(entries, session['username'], session['password'])
-        return redirect(url_for('home'))
+    db = get_db()
+    uid = session["user_id"]
+    uname = session["username"]
+    pw = session["password"]
 
-    for entry in entries:
-        created = datetime.fromisoformat(entry['created'])
-        entry['expired'] = (datetime.now() - created) > timedelta(days=30)
-        entry['strength'] = check_strength(entry['password'])
+    if request.method == "POST":
+        title = request.form["title"]
+        username = encrypt_text(request.form["username"], uname, pw)
+        password = encrypt_text(request.form["password"], uname, pw)
+        created = datetime.now().isoformat()
+        db.execute("INSERT INTO entries (user_id, title, username, password, created) VALUES (?, ?, ?, ?, ?)",
+                   (uid, title, username, password, created))
+        db.commit()
+        return redirect(url_for("home"))
+
+    cur = db.execute("SELECT * FROM entries WHERE user_id = ?", (uid,))
+    entries = []
+    for row in cur.fetchall():
+        try:
+            entry = {
+                "title": row["title"],
+                "username": decrypt_text(row["username"], uname, pw),
+                "password": decrypt_text(row["password"], uname, pw),
+                "created": row["created"]
+            }
+            entry["expired"] = (datetime.now() - datetime.fromisoformat(entry["created"])) > timedelta(days=30)
+            entry["strength"] = check_strength(entry["password"])
+            entries.append(entry)
+        except:
+            continue
 
     return render_template_string(home_html, entries=entries)
 
-@app.route('/delete/<int:index>')
-def delete(index):
-    if 'username' not in session:
-        return redirect(url_for('login'))
-    data = load_data(session['username'], session['password'])
-    if 0 <= index < len(data):
-        data.pop(index)
-        save_data(data, session['username'], session['password'])
-    return redirect(url_for('home'))
+@app.route("/delete/<int:eid>")
+def delete(eid):
+    if "user_id" not in session:
+        return redirect(url_for("login"))
+    db = get_db()
+    db.execute("DELETE FROM entries WHERE id = ? AND user_id = ?", (eid, session["user_id"]))
+    db.commit()
+    return redirect(url_for("home"))
 
-@app.route('/backup')
-def backup():
-    if 'username' not in session:
-        return redirect(url_for('login'))
-    data = load_data(session['username'], session['password'])
-    encrypted_json = encrypt_data(data, session['username'], session['password'])
-    return send_file(BytesIO(encrypted_json), mimetype='application/octet-stream',
-                     as_attachment=True, download_name='passwords_backup.enc')
-
-@app.route('/logout')
+@app.route("/logout")
 def logout():
     session.clear()
-    return redirect(url_for('login'))
+    return redirect(url_for("login"))
 
-login_html = """<!doctype html><html><head><title>Login</title></head><body class="container">
+# HTML templates
+login_html = """<!doctype html><html><head><title>Login</title></head><body>
 <h2>Login</h2>
 <form method="post">
   Username: <input name="username"><br>
   Password: <input type="password" name="password"><br>
   <button type="submit">Login</button>
 </form>
-<p>Or <a href="/register">Register</a></p></body></html>"""
+<p><a href="/register">Register</a></p></body></html>"""
 
-register_html = """<!doctype html><html><head><title>Register</title></head><body class="container">
+register_html = """<!doctype html><html><head><title>Register</title></head><body>
 <h2>Register</h2>
 <form method="post">
   Username: <input name="username"><br>
@@ -160,43 +180,27 @@ register_html = """<!doctype html><html><head><title>Register</title></head><bod
   <button type="submit">Register</button>
 </form></body></html>"""
 
-home_html = """<!doctype html><html><head>
-<title>Dashboard</title>
-<link rel="stylesheet" href="/static/static.css">
-<script>
-function setTheme(bg, input) {
-  document.body.style.backgroundColor = bg;
-  document.querySelectorAll('input, textarea').forEach(el => el.style.backgroundColor = input);
-}
-</script>
-</head><body class="container">
-<h2>Welcome {{ session['username'] }} <small style="font-weight:normal;">(Phase 2 - Fixed Key)</small></h2>
-<a href="/logout">Logout</a>
-<a href="/backup" style="float:right;">Download Backup</a>
-<hr>
-<h3>Add New Login</h3>
+home_html = """<!doctype html><html><head><title>Vaultyx</title></head><body>
+<h2>Welcome {{ session['username'] }}</h2>
+<a href="/logout">Logout</a><hr>
+<h3>Add Login</h3>
 <form method="post">
   Title: <input name="title"><br>
   Username: <input name="username"><br>
-  Password: <input name="password" id="pwd"><br>
-  <button type="button" onclick="document.getElementById('pwd').value=Math.random().toString(36).slice(-12)">Generate</button>
+  Password: <input name="password"><br>
   <button type="submit">Save</button>
-</form>
-<hr>
-<h3>Stored Logins</h3>
+</form><hr>
+<h3>Saved Entries</h3>
 {% for e in entries %}
-<div class="card">
-  <strong>{{ e['title'] }}</strong><br>
-  Username: {{ e['username'] }}<br>
-  Password: {{ e['password'] }}<br>
-  Strength: <span class="{{ e['strength'].lower() }}">{{ e['strength'] }}</span>
-  {% if e['expired'] %}<br><span class="expired">Password expired!</span>{% endif %}<br>
+<div>
+  <b>{{ e.title }}</b><br>
+  Username: {{ e.username }}<br>
+  Password: {{ e.password }}<br>
+  Strength: <span style="color: {% if e.strength == 'Strong' %}green{% elif e.strength == 'Okay' %}orange{% else %}red{% endif %};">{{ e.strength }}</span>
+  {% if e.expired %}<br><span style="color:red;">Expired</span>{% endif %}<br>
   <a href="/delete/{{ loop.index0 }}">Delete</a>
-</div>
+</div><hr>
 {% endfor %}
-<h3>Theme</h3>
-<button onclick="setTheme('#111', '#333')">Dark Mode</button>
-<button onclick="setTheme('#fff', '#f0f0f0')">Light Mode</button>
 </body></html>"""
 
 if __name__ == "__main__":
